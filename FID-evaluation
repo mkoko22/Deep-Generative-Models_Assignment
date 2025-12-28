@@ -1,0 +1,545 @@
+"""
+CycleGAN FID Evaluation Script
+Compare ResNet vs U-Net Generator Performance
+
+1. Loads trained models from both experiments
+2. Generates fake Monet images from real photos
+3. Calculates FID scores
+4. Creates visual comparisons
+
+"""
+
+from google.colab import drive
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from torchvision.utils import save_image, make_grid
+from PIL import Image
+from glob import glob
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from scipy import linalg
+from torch.nn.functional import adaptive_avg_pool2d
+
+# Mount drive
+drive.mount('/content/drive', force_remount=False)
+
+print("CycleGAN FID Evaluation: ResNet vs U-Net")
+
+# CONFIGURATION
+class EvalConfig:
+    base_dir = '/content/drive/MyDrive/DGM-assignment'
+    data_dir = os.path.join(base_dir, 'cyclegan_data')
+    monet_path = os.path.join(data_dir, 'monet_jpg')
+    photo_path = os.path.join(data_dir, 'photo_jpg')
+    
+    resnet_checkpoint = os.path.join(base_dir, 'cyclegan_checkpoints', 'checkpoint_epoch_100.pth')
+    unet_checkpoint = os.path.join(base_dir, 'cyclegan_unet_checkpoints', 'checkpoint_epoch_100.pth')
+    
+    eval_output_dir = os.path.join(base_dir, 'evaluation_results')
+    resnet_generated_dir = os.path.join(eval_output_dir, 'resnet_generated')
+    unet_generated_dir = os.path.join(eval_output_dir, 'unet_generated')
+    comparison_dir = os.path.join(eval_output_dir, 'comparisons')
+    
+    img_size = 128
+    batch_size = 4
+    num_fid_images = 300
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+config = EvalConfig()
+
+os.makedirs(config.eval_output_dir, exist_ok=True)
+os.makedirs(config.resnet_generated_dir, exist_ok=True)
+os.makedirs(config.unet_generated_dir, exist_ok=True)
+os.makedirs(config.comparison_dir, exist_ok=True)
+
+print(f"\nDevice: {config.device}")
+print(f"ResNet checkpoint: {os.path.exists(config.resnet_checkpoint)}")
+print(f"U-Net checkpoint: {os.path.exists(config.unet_checkpoint)}")
+
+
+# MODEL ARCHITECTURES
+
+# ResNet Generator
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(channels, channels, 3),
+            nn.InstanceNorm2d(channels, affine=True),
+            nn.ReLU(inplace=True),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(channels, channels, 3),
+            nn.InstanceNorm2d(channels, affine=True)
+        )
+    def forward(self, x):
+        return x + self.block(x)
+
+
+class ResNetGenerator(nn.Module):
+    def __init__(self, input_channels=3, output_channels=3, ngf=64, n_residual_blocks=6):
+        super().__init__()
+        model = [
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(input_channels, ngf, 7),
+            nn.InstanceNorm2d(ngf),
+            nn.ReLU(inplace=True)
+        ]
+        in_f, out_f = ngf, ngf*2
+        for _ in range(2):
+            model += [
+                nn.Conv2d(in_f, out_f, 3, stride=2, padding=1),
+                nn.InstanceNorm2d(out_f),
+                nn.ReLU(inplace=True)
+            ]
+            in_f = out_f
+            out_f = in_f*2
+
+        for _ in range(n_residual_blocks):
+            model += [ResidualBlock(in_f)]
+
+        out_f = in_f//2
+        for _ in range(2):
+            model += [
+                nn.ConvTranspose2d(in_f, out_f, 3, stride=2, padding=1, output_padding=1),
+                nn.InstanceNorm2d(out_f),
+                nn.ReLU(inplace=True)
+            ]
+            in_f = out_f
+            out_f = in_f//2
+        model += [
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(ngf, output_channels, 7),
+            nn.Tanh()
+        ]
+        self.model = nn.Sequential(*model)
+    
+    def forward(self, x):
+        return self.model(x)
+
+
+# U-Net Generator
+class UNetDownBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, normalize=True):
+        super().__init__()
+        layers = [nn.Conv2d(in_channels, out_channels, 4, stride=2, padding=1, bias=False)]
+        if normalize:
+            layers.append(nn.InstanceNorm2d(out_channels))
+        layers.append(nn.LeakyReLU(0.2, inplace=True))
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class UNetUpBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, dropout=0.0):
+        super().__init__()
+        layers = [
+            nn.ConvTranspose2d(in_channels, out_channels, 4, stride=2, padding=1, bias=False),
+            nn.InstanceNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        ]
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x, skip_input):
+        x = self.model(x)
+        x = torch.cat([x, skip_input], dim=1)
+        return x
+
+
+class UNetGenerator(nn.Module):
+    def __init__(self, input_channels=3, output_channels=3, ngf=64):
+        super().__init__()
+
+        self.down1 = UNetDownBlock(input_channels, ngf, normalize=False)
+        self.down2 = UNetDownBlock(ngf, ngf*2)
+        self.down3 = UNetDownBlock(ngf*2, ngf*4)
+        self.down4 = UNetDownBlock(ngf*4, ngf*8)
+        self.down5 = UNetDownBlock(ngf*8, ngf*8)
+
+        self.up1 = UNetUpBlock(ngf*8, ngf*8, dropout=0.5)
+        self.up2 = UNetUpBlock(ngf*16, ngf*4, dropout=0.5)
+        self.up3 = UNetUpBlock(ngf*8, ngf*2)
+        self.up4 = UNetUpBlock(ngf*4, ngf)
+
+        self.final = nn.Sequential(
+            nn.ConvTranspose2d(ngf*2, output_channels, 4, stride=2, padding=1),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        d1 = self.down1(x)
+        d2 = self.down2(d1)
+        d3 = self.down3(d2)
+        d4 = self.down4(d3)
+        d5 = self.down5(d4)
+
+        u1 = self.up1(d5, d4)
+        u2 = self.up2(u1, d3)
+        u3 = self.up3(u2, d2)
+        u4 = self.up4(u3, d1)
+
+        return self.final(u4)
+
+
+# INCEPTION V3 FOR FID
+from torchvision.models import inception_v3
+
+class InceptionV3FeatureExtractor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        inception = inception_v3(pretrained=True, transform_input=False)
+        inception.eval()
+        
+        self.feature_extractor = nn.Sequential(
+            inception.Conv2d_1a_3x3,
+            inception.Conv2d_2a_3x3,
+            inception.Conv2d_2b_3x3,
+            nn.MaxPool2d(kernel_size=3, stride=2),
+            inception.Conv2d_3b_1x1,
+            inception.Conv2d_4a_3x3,
+            nn.MaxPool2d(kernel_size=3, stride=2),
+            inception.Mixed_5b,
+            inception.Mixed_5c,
+            inception.Mixed_5d,
+            inception.Mixed_6a,
+            inception.Mixed_6b,
+            inception.Mixed_6c,
+            inception.Mixed_6d,
+            inception.Mixed_6e,
+            inception.Mixed_7a,
+            inception.Mixed_7b,
+            inception.Mixed_7c,
+        )
+        
+        # Freeze parameters
+        for param in self.parameters():
+            param.requires_grad = False
+    
+    def forward(self, x):
+        if x.shape[2] != 299 or x.shape[3] != 299:
+            x = nn.functional.interpolate(x, size=(299, 299), mode='bilinear', align_corners=False)
+        
+        # Normalize for Inception (expects [0, 1] range)
+        x = (x + 1) / 2.0  # Convert from [-1, 1] to [0, 1]
+        
+        # Extract features
+        x = self.feature_extractor(x)
+        
+        # Global average pooling
+        x = adaptive_avg_pool2d(x, output_size=(1, 1))
+        x = torch.flatten(x, 1)
+        
+        return x
+
+
+# FID CALCULATION
+def calculate_activation_statistics(images, model, batch_size=50, device='cuda'):
+    # Calculate mean and covariance of features
+    model.eval()
+    
+    act_list = []
+    
+    with torch.no_grad():
+        for i in range(0, len(images), batch_size):
+            batch = images[i:i+batch_size].to(device)
+            features = model(batch)
+            act_list.append(features.cpu().numpy())
+    
+    activations = np.concatenate(act_list, axis=0)
+    mu = np.mean(activations, axis=0)
+    sigma = np.cov(activations, rowvar=False)
+    
+    return mu, sigma
+
+
+def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
+    # Calculate Frechet Distance between two Gaussians
+    mu1 = np.atleast_1d(mu1)
+    mu2 = np.atleast_1d(mu2)
+    
+    sigma1 = np.atleast_2d(sigma1)
+    sigma2 = np.atleast_2d(sigma2)
+    
+    diff = mu1 - mu2
+    
+    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+    if not np.isfinite(covmean).all():
+        offset = np.eye(sigma1.shape[0]) * eps
+        covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
+    
+    if np.iscomplexobj(covmean):
+        if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
+            m = np.max(np.abs(covmean.imag))
+            raise ValueError(f'Imaginary component {m}')
+        covmean = covmean.real
+    
+    tr_covmean = np.trace(covmean)
+    
+    fid = diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean
+    
+    return fid
+
+
+# DATASET
+class ImageDataset(Dataset):
+    def __init__(self, root, transform=None):
+        self.transform = transform
+        self.files = sorted(glob(os.path.join(root, '*.jpg')))
+        print(f"Found {len(self.files)} images in {root}")
+
+    def __getitem__(self, idx):
+        img = Image.open(self.files[idx]).convert('RGB')
+        if self.transform:
+            img = self.transform(img)
+        return img
+
+    def __len__(self):
+        return len(self.files)
+
+
+# LOAD MODELS
+print("Loading Models...")
+
+# Load ResNet Generator
+print("\nLoading ResNet Generator...")
+resnet_gen = ResNetGenerator(3, 3, 64, 6).to(config.device)
+resnet_checkpoint = torch.load(config.resnet_checkpoint, map_location=config.device)
+resnet_gen.load_state_dict(resnet_checkpoint['G_AB_state_dict'])
+resnet_gen.eval()
+print("ResNet Generator loaded")
+
+# Load U-Net Generator
+print("\nLoading U-Net Generator...")
+unet_gen = UNetGenerator(3, 3, 64).to(config.device)
+unet_checkpoint = torch.load(config.unet_checkpoint, map_location=config.device)
+unet_gen.load_state_dict(unet_checkpoint['G_AB_state_dict'])
+unet_gen.eval()
+print("U-Net Generator loaded")
+
+# Load Inception model for FID
+print("\nLoading Inception V3 for FID calculation...")
+inception_model = InceptionV3FeatureExtractor().to(config.device)
+inception_model.eval()
+print("Inception V3 loaded")
+
+
+# GENERATE IMAGES
+print("Generating Images...")
+
+# Prepare transforms and datasets
+transform = transforms.Compose([
+    transforms.Resize((config.img_size, config.img_size), Image.BICUBIC),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
+])
+
+photo_dataset = ImageDataset(config.photo_path, transform)
+monet_dataset = ImageDataset(config.monet_path, transform)
+
+# Limit to num_fid_images
+photo_subset = torch.utils.data.Subset(photo_dataset, range(min(config.num_fid_images, len(photo_dataset))))
+photo_loader = DataLoader(photo_subset, batch_size=config.batch_size, shuffle=False, num_workers=2)
+
+print(f"\nGenerating {len(photo_subset)} images with each generator...")
+
+# Generate with ResNet
+resnet_generated = []
+print("\nGenerating with ResNet...")
+with torch.no_grad():
+    for i, real_photos in enumerate(tqdm(photo_loader)):
+        real_photos = real_photos.to(config.device)
+        fake_monet = resnet_gen(real_photos)
+        resnet_generated.append(fake_monet.cpu())
+        
+        if i < 10:
+            for j in range(fake_monet.shape[0]):
+                save_image(
+                    fake_monet[j],
+                    os.path.join(config.resnet_generated_dir, f'img_{i*config.batch_size+j:04d}.png'),
+                    normalize=True,
+                    value_range=(-1, 1)
+                )
+
+resnet_generated = torch.cat(resnet_generated, dim=0)
+print(f" Generated {len(resnet_generated)} images with ResNet")
+
+# Generate with U-Net
+unet_generated = []
+print("\nGenerating with U-Net...")
+with torch.no_grad():
+    for i, real_photos in enumerate(tqdm(photo_loader)):
+        real_photos = real_photos.to(config.device)
+        fake_monet = unet_gen(real_photos)
+        unet_generated.append(fake_monet.cpu())
+        
+        if i < 10:
+            for j in range(fake_monet.shape[0]):
+                save_image(
+                    fake_monet[j],
+                    os.path.join(config.unet_generated_dir, f'img_{i*config.batch_size+j:04d}.png'),
+                    normalize=True,
+                    value_range=(-1, 1)
+                )
+
+unet_generated = torch.cat(unet_generated, dim=0)
+print(f"Generated {len(unet_generated)} images with U-Net")
+
+# Load real Monet images
+print("\nLoading real Monet images...")
+monet_loader = DataLoader(monet_dataset, batch_size=config.batch_size, shuffle=False, num_workers=2)
+real_monet = []
+for real_imgs in tqdm(monet_loader):
+    real_monet.append(real_imgs)
+real_monet = torch.cat(real_monet, dim=0)
+print(f"Loaded {len(real_monet)} real Monet images")
+
+
+# CALCULATE FID SCORES
+print("Calculating FID Scores...")
+
+# Calculate statistics for real Monet images
+print("\nCalculating statistics for real Monet images...")
+mu_real, sigma_real = calculate_activation_statistics(real_monet, inception_model, batch_size=32, device=config.device)
+print("Real Monet statistics calculated")
+
+# Calculate statistics for ResNet generated images
+print("\nCalculating statistics for ResNet generated images...")
+mu_resnet, sigma_resnet = calculate_activation_statistics(resnet_generated, inception_model, batch_size=32, device=config.device)
+fid_resnet = calculate_frechet_distance(mu_real, sigma_real, mu_resnet, sigma_resnet)
+print(f"ResNet FID Score: {fid_resnet:.2f}")
+
+# Calculate statistics for U-Net generated images
+print("\nCalculating statistics for U-Net generated images...")
+mu_unet, sigma_unet = calculate_activation_statistics(unet_generated, inception_model, batch_size=32, device=config.device)
+fid_unet = calculate_frechet_distance(mu_real, sigma_real, mu_unet, sigma_unet)
+print(f"U-Net FID Score: {fid_unet:.2f}")
+
+
+# CREATE VISUAL COMPARISONS
+print("Creating Visual Comparisons...")
+
+num_comparison_samples = 8
+photo_loader_comp = DataLoader(
+    torch.utils.data.Subset(photo_dataset, range(num_comparison_samples)),
+    batch_size=num_comparison_samples,
+    shuffle=False
+)
+
+with torch.no_grad():
+    sample_photos = next(iter(photo_loader_comp)).to(config.device)
+    resnet_output = resnet_gen(sample_photos)
+    unet_output = unet_gen(sample_photos)
+
+# Create comparison grid: [Photo | ResNet | U-Net]
+comparison_grid = []
+for i in range(num_comparison_samples):
+    comparison_grid.extend([
+        sample_photos[i].cpu(),
+        resnet_output[i].cpu(),
+        unet_output[i].cpu()
+    ])
+
+grid = make_grid(comparison_grid, nrow=3, normalize=True, value_range=(-1, 1), padding=2)
+save_image(grid, os.path.join(config.comparison_dir, 'comparison_grid.png'))
+print(f"Saved comparison grid")
+
+# Create individual comparisons
+for i in range(min(4, num_comparison_samples)):
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    
+    # Photo
+    img = sample_photos[i].cpu().permute(1, 2, 0).numpy()
+    img = (img + 1) / 2.0
+    axes[0].imshow(img)
+    axes[0].set_title('Real Photo', fontsize=14, fontweight='bold')
+    axes[0].axis('off')
+    
+    # ResNet
+    img = resnet_output[i].cpu().permute(1, 2, 0).numpy()
+    img = (img + 1) / 2.0
+    axes[1].imshow(img)
+    axes[1].set_title(f'ResNet (FID: {fid_resnet:.2f})', fontsize=14, fontweight='bold')
+    axes[1].axis('off')
+    
+    # U-Net
+    img = unet_output[i].cpu().permute(1, 2, 0).numpy()
+    img = (img + 1) / 2.0
+    axes[2].imshow(img)
+    axes[2].set_title(f'U-Net (FID: {fid_unet:.2f})', fontsize=14, fontweight='bold')
+    axes[2].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(config.comparison_dir, f'comparison_{i+1}.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
+print(f"Saved individual comparison images")
+
+
+# SAVE RESULTS
+print("Saving Results...")
+
+results = {
+    'ResNet FID': fid_resnet,
+    'U-Net FID': fid_unet,
+    'Best Model': 'ResNet' if fid_resnet < fid_unet else 'U-Net',
+    'FID Improvement': abs(fid_resnet - fid_unet),
+    'Number of Images': len(resnet_generated)
+}
+
+with open(os.path.join(config.eval_output_dir, 'fid_results.txt'), 'w') as f:
+    f.write("CycleGAN FID Evaluation Results\n")
+    f.write(f"Experiment 1 - ResNet Generator:\n")
+    f.write(f"  FID Score: {fid_resnet:.4f}\n\n")
+    f.write(f"Experiment 2 - U-Net Generator:\n")
+    f.write(f"  FID Score: {fid_unet:.4f}\n\n")
+    f.write(f"Best Model: {results['Best Model']}\n")
+    f.write(f"FID Difference: {results['FID Improvement']:.4f}\n")
+    f.write(f"Number of images evaluated: {results['Number of Images']}\n")
+
+print("Results saved to fid_results.txt")
+
+plt.figure(figsize=(10, 6))
+models = ['ResNet\nGenerator', 'U-Net\nGenerator']
+fid_scores = [fid_resnet, fid_unet]
+colors = ['#3498db' if fid_resnet < fid_unet else '#95a5a6', 
+          '#e74c3c' if fid_unet < fid_resnet else '#95a5a6']
+
+bars = plt.bar(models, fid_scores, color=colors, alpha=0.8, edgecolor='black', linewidth=2)
+
+for bar, score in zip(bars, fid_scores):
+    height = bar.get_height()
+    plt.text(bar.get_x() + bar.get_width()/2., height,
+             f'{score:.2f}',
+             ha='center', va='bottom', fontsize=16, fontweight='bold')
+
+plt.ylabel('FID Score', fontsize=14, fontweight='bold')
+plt.title('CycleGAN Generator Comparison', fontsize=16, fontweight='bold')
+plt.ylim(0, max(fid_scores) * 1.2)
+plt.grid(axis='y', alpha=0.3, linestyle='--')
+plt.tight_layout()
+plt.savefig(os.path.join(config.eval_output_dir, 'fid_comparison.png'), dpi=300, bbox_inches='tight')
+plt.close()
+
+print("FID comparison chart saved")
+
+# FINAL SUMMARY
+print("EVALUATION COMPLETE!")
+print(f"\nResults Summary:")
+print(f"   ResNet FID:  {fid_resnet:.4f}")
+print(f"   U-Net FID:   {fid_unet:.4f}")
+print(f"   Winner:      {results['Best Model']} (by {results['FID Improvement']:.4f})")
+print(f"\nOutputs saved to: {config.eval_output_dir}")
+print(f"   - fid_results.txt")
+print(f"   - fid_comparison.png")
+print(f"   - comparison_grid.png")
+print(f"   - Individual comparison images (1-4)")
+print(f"   - Generated images in resnet_generated/ and unet_generated/")
+print("\nReady for WandB report.")
