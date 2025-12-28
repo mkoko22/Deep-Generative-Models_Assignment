@@ -1,0 +1,537 @@
+"""
+CycleGAN Training Notebook with Res-Net Generator
+Kaggle Competition: I'm Something of a Painter Myself
+
+"""
+
+from google.colab import drive
+import os
+import shutil
+
+drive.mount('/content/drive', force_remount=False)
+
+BASE_DIR = '/content/drive/MyDrive/DGM-assignment'
+DATA_DIR = os.path.join(BASE_DIR, 'cyclegan_data')
+
+LOCAL_BASE = '/content'
+LOCAL_DATA_DIR = os.path.join(LOCAL_BASE, 'cyclegan_data')
+
+drive_monet_path = os.path.join(DATA_DIR, 'monet_jpg')
+drive_photo_path = os.path.join(DATA_DIR, 'photo_jpg')
+
+print("Drive Monet path exists:", os.path.exists(drive_monet_path))
+print("Drive Photo path exists:", os.path.exists(drive_photo_path))
+
+if os.path.exists(drive_monet_path):
+    print("Drive Monet images:", len(os.listdir(drive_monet_path)))
+if os.path.exists(drive_photo_path):
+    print("Drive Photo images:", len(os.listdir(drive_photo_path)))
+
+local_monet_path = os.path.join(LOCAL_DATA_DIR, 'monet_jpg')
+local_photo_path = os.path.join(LOCAL_DATA_DIR, 'photo_jpg')
+
+monet_path = local_monet_path
+photo_path = local_photo_path
+
+print("Local Monet path exists:", os.path.exists(monet_path))
+print("Local Photo path exists:", os.path.exists(photo_path))
+
+if os.path.exists(monet_path):
+    print("Local Monet images:", len(os.listdir(monet_path)))
+if os.path.exists(photo_path):
+    print("Local Photo images:", len(os.listdir(photo_path)))
+
+
+# IMPORTS
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from torchvision.utils import save_image, make_grid
+from PIL import Image
+import wandb
+from tqdm import tqdm
+import itertools
+from glob import glob
+
+print(f"\nPyTorch version: {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+
+
+# CONFIGURATION
+class Config:
+    base_dir = '/content/drive/MyDrive/DGM-assignment'
+    data_dir = os.path.join('/content', 'cyclegan_data')
+    monet_path = os.path.join(data_dir, 'monet_jpg')
+    photo_path = os.path.join(data_dir, 'photo_jpg')
+
+    checkpoint_dir = os.path.join(base_dir, 'cyclegan_checkpoints')
+    output_dir = os.path.join(base_dir, 'cyclegan_outputs')
+
+    # Training parameters
+    epochs = 100
+    batch_size = 2
+    lr = 0.0002
+    beta1 = 0.5
+    beta2 = 0.999
+
+    # Loss weights
+    lambda_cycle = 10.0
+    lambda_identity = 5.0
+
+    img_size = 128
+    input_channels = 3
+    output_channels = 3
+    ngf = 64
+    ndf = 64
+    n_residual_blocks = 6
+
+    checkpoint_every = 1
+    sample_every = 1
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    seed = 42
+    use_amp = True
+
+    wandb_project = 'CycleGAN-Monet'
+    wandb_entity = 'mkoko22-free-university-of-tbilisi-'
+    use_wandb = True
+
+config = Config()
+os.makedirs(config.checkpoint_dir, exist_ok=True)
+os.makedirs(config.output_dir, exist_ok=True)
+
+print("\nChecking Config paths:")
+print(f"Monet path: {config.monet_path}")
+print(f"Monet exists: {os.path.exists(config.monet_path)}")
+if os.path.exists(config.monet_path):
+    print(f"Monet images: {len(os.listdir(config.monet_path))}")
+print(f"Photo path: {config.photo_path}")
+print(f"Photo exists: {os.path.exists(config.photo_path)}")
+if os.path.exists(config.photo_path):
+    print(f"Photo images: {len(os.listdir(config.photo_path))}")
+
+
+# SEED
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(config.seed)
+
+
+# RESIDUAL BLOCK
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(channels, channels, 3),
+            nn.InstanceNorm2d(channels, affine=True),
+            nn.ReLU(inplace=True),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(channels, channels, 3),
+            nn.InstanceNorm2d(channels, affine=True)
+        )
+    def forward(self, x):
+        return x + self.block(x)
+
+
+# GENERATOR
+class Generator(nn.Module):
+    def __init__(self, input_channels=3, output_channels=3, ngf=64, n_residual_blocks=6):
+        super().__init__()
+        model = [
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(input_channels, ngf, 7),
+            nn.InstanceNorm2d(ngf),
+            nn.ReLU(inplace=True)
+        ]
+        in_f, out_f = ngf, ngf*2
+        for _ in range(2):
+            model += [
+                nn.Conv2d(in_f, out_f, 3, stride=2, padding=1),
+                nn.InstanceNorm2d(out_f),
+                nn.ReLU(inplace=True)
+            ]
+            in_f = out_f
+            out_f = in_f*2
+
+        for _ in range(n_residual_blocks):
+            model += [ResidualBlock(in_f)]
+
+        out_f = in_f//2
+        for _ in range(2):
+            model += [
+                nn.ConvTranspose2d(in_f, out_f, 3, stride=2, padding=1, output_padding=1),
+                nn.InstanceNorm2d(out_f),
+                nn.ReLU(inplace=True)
+            ]
+            in_f = out_f
+            out_f = in_f//2
+        model += [
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(ngf, output_channels, 7),
+            nn.Tanh()
+        ]
+        self.model = nn.Sequential(*model)
+    def forward(self, x):
+        return self.model(x)
+
+
+# DISCRIMINATOR
+class Discriminator(nn.Module):
+    def __init__(self, input_channels=3, ndf=64):
+        super().__init__()
+        model = [
+            nn.Conv2d(input_channels, ndf, 4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True)
+        ]
+        nf_mult = 1
+        for i in range(3):
+            nf_mult_prev = nf_mult
+            nf_mult = min(2**(i+1), 8)
+            stride = 2 if i < 2 else 1
+            model += [
+                nn.Conv2d(ndf*nf_mult_prev, ndf*nf_mult, 4, stride=stride, padding=1),
+                nn.InstanceNorm2d(ndf*nf_mult),
+                nn.LeakyReLU(0.2, inplace=True)
+            ]
+        model += [nn.Conv2d(ndf*nf_mult, 1, 4, stride=1, padding=1)]
+        self.model = nn.Sequential(*model)
+    def forward(self, x):
+        return self.model(x)
+
+
+# LOSS FUNCTIONS
+class CycleGANLosses:
+    @staticmethod
+    def adversarial_loss_lsgan(pred, target_is_real):
+        target = torch.ones_like(pred) if target_is_real else torch.zeros_like(pred)
+        return torch.mean((pred - target) ** 2)
+
+    @staticmethod
+    def cycle_consistency_loss(real, recon):
+        return torch.mean(torch.abs(real - recon))
+
+    @staticmethod
+    def identity_loss(real, same):
+        return torch.mean(torch.abs(real - same))
+
+
+# DATASET
+class ImageDataset(Dataset):
+    def __init__(self, root_monet, root_photo, transform=None):
+        self.transform = transform
+        self.files_monet = sorted(glob(os.path.join(root_monet, '*.jpg')))
+        self.files_photo = sorted(glob(os.path.join(root_photo, '*.jpg')))
+        print(f"Found {len(self.files_monet)} Monet images and {len(self.files_photo)} photo images")
+
+    def __getitem__(self, idx):
+        monet_file = self.files_monet[idx % len(self.files_monet)]
+        photo_file = self.files_photo[random.randint(0, len(self.files_photo) - 1)]
+
+        with Image.open(monet_file) as im_m:
+            img_monet = im_m.convert('RGB')
+        with Image.open(photo_file) as im_p:
+            img_photo = im_p.convert('RGB')
+
+        if self.transform:
+            img_monet = self.transform(img_monet)
+            img_photo = self.transform(img_photo)
+
+        return {'monet': img_monet, 'photo': img_photo}
+
+    def __len__(self):
+        return max(len(self.files_monet), len(self.files_photo))
+
+
+# TRANSFORMS
+transform = transforms.Compose([
+    transforms.Resize((config.img_size, config.img_size), Image.BICUBIC),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
+])
+
+dataset = ImageDataset(config.monet_path, config.photo_path, transform)
+
+dataloader = DataLoader(
+    dataset,
+    batch_size=config.batch_size,
+    shuffle=True,
+    num_workers=num_workers,
+    pin_memory=torch.cuda.is_available(),
+    persistent_workers=(num_workers > 0),
+    prefetch_factor=2 if num_workers > 0 else None
+)
+
+# INITIALIZE MODELS
+print("\nInitializing models...")
+G_AB = Generator(config.input_channels, config.output_channels, config.ngf, config.n_residual_blocks).to(config.device)
+G_BA = Generator(config.output_channels, config.input_channels, config.ngf, config.n_residual_blocks).to(config.device)
+D_A  = Discriminator(config.input_channels, config.ndf).to(config.device)
+D_B  = Discriminator(config.output_channels, config.ndf).to(config.device)
+
+
+# WEIGHT INIT
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
+        if hasattr(m, 'bias') and m.bias is not None:
+            nn.init.constant_(m.bias.data, 0.0)
+    elif classname.find('BatchNorm') != -1 or classname.find('InstanceNorm') != -1:
+        if hasattr(m, 'weight') and m.weight is not None:
+            nn.init.normal_(m.weight.data, 1.0, 0.02)
+        if hasattr(m, 'bias') and m.bias is not None:
+            nn.init.constant_(m.bias.data, 0.0)
+
+G_AB.apply(weights_init)
+G_BA.apply(weights_init)
+D_A.apply(weights_init)
+D_B.apply(weights_init)
+
+
+# OPTIMIZERS
+optimizer_G = optim.Adam(
+    itertools.chain(G_AB.parameters(), G_BA.parameters()),
+    lr=config.lr,
+    betas=(config.beta1, config.beta2)
+)
+optimizer_D_A = optim.Adam(D_A.parameters(), lr=config.lr, betas=(config.beta1, config.beta2))
+optimizer_D_B = optim.Adam(D_B.parameters(), lr=config.lr, betas=(config.beta1, config.beta2))
+
+
+# LR SCHEDULERS
+def lambda_rule(epoch):
+    lr_l = 1.0 - max(0, epoch - config.epochs//2) / float(config.epochs//2 + 1)
+    return lr_l
+
+scheduler_G   = optim.lr_scheduler.LambdaLR(optimizer_G,   lr_lambda=lambda_rule)
+scheduler_D_A = optim.lr_scheduler.LambdaLR(optimizer_D_A, lr_lambda=lambda_rule)
+scheduler_D_B = optim.lr_scheduler.LambdaLR(optimizer_D_B, lr_lambda=lambda_rule)
+
+
+# AMP SCALER
+scaler = torch.amp.GradScaler('cuda', enabled=(config.use_amp and torch.cuda.is_available()))
+losses = CycleGANLosses()
+
+
+# LOAD CHECKPOINT
+checkpoint_files = sorted(glob(os.path.join(config.checkpoint_dir, 'checkpoint_epoch_*.pth')))
+start_epoch = 0
+if checkpoint_files:
+    latest_ckpt = checkpoint_files[-1]
+    print(f"\nFound checkpoint: {latest_ckpt}")
+    ckpt = torch.load(latest_ckpt, map_location=config.device)
+    G_AB.load_state_dict(ckpt['G_AB_state_dict'])
+    G_BA.load_state_dict(ckpt['G_BA_state_dict'])
+    D_A.load_state_dict(ckpt['D_A_state_dict'])
+    D_B.load_state_dict(ckpt['D_B_state_dict'])
+    optimizer_G.load_state_dict(ckpt['optimizer_G_state_dict'])
+    optimizer_D_A.load_state_dict(ckpt['optimizer_D_A_state_dict'])
+    optimizer_D_B.load_state_dict(ckpt['optimizer_D_B_state_dict'])
+    if 'scheduler_G_state_dict' in ckpt:
+        scheduler_G.load_state_dict(ckpt['scheduler_G_state_dict'])
+    if 'scheduler_D_A_state_dict' in ckpt:
+        scheduler_D_A.load_state_dict(ckpt['scheduler_D_A_state_dict'])
+    if 'scheduler_D_B_state_dict' in ckpt:
+        scheduler_D_B.load_state_dict(ckpt['scheduler_D_B_state_dict'])
+
+    start_epoch = ckpt['epoch'] + 1
+    print(f"Resuming from epoch {start_epoch}")
+
+
+# TRAIN FUNCTION
+def train():
+    global start_epoch
+
+    use_cuda = torch.cuda.is_available()
+    device = config.device
+
+    for epoch in range(start_epoch, config.epochs):
+        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{config.epochs}", ncols=120)
+
+        epoch_losses = {
+            "G_total": 0.0, "G_GAN_AB": 0.0, "G_GAN_BA": 0.0,
+            "G_cycle_A": 0.0, "G_cycle_B": 0.0, "G_idt_A": 0.0, "G_idt_B": 0.0,
+            "D_A": 0.0, "D_B": 0.0
+        }
+
+        for i, batch in enumerate(progress_bar):
+            real_A = batch['photo'].to(device, non_blocking=use_cuda)
+            real_B = batch['monet'].to(device, non_blocking=use_cuda)
+
+            # Train Generators
+            optimizer_G.zero_grad(set_to_none=True)
+            with torch.amp.autocast('cuda', enabled=config.use_amp):
+                # Identity loss
+                idt_A = G_BA(real_A)
+                idt_B = G_AB(real_B)
+                loss_idt_A = losses.identity_loss(real_A, idt_A) * config.lambda_identity
+                loss_idt_B = losses.identity_loss(real_B, idt_B) * config.lambda_identity
+
+                # GAN loss
+                fake_B = G_AB(real_A)
+                fake_A = G_BA(real_B)
+                loss_GAN_AB = losses.adversarial_loss_lsgan(D_B(fake_B), True)
+                loss_GAN_BA = losses.adversarial_loss_lsgan(D_A(fake_A), True)
+
+                # Cycle consistency loss
+                recov_A = G_BA(fake_B)
+                recov_B = G_AB(fake_A)
+                loss_cycle_A = losses.cycle_consistency_loss(real_A, recov_A) * config.lambda_cycle
+                loss_cycle_B = losses.cycle_consistency_loss(real_B, recov_B) * config.lambda_cycle
+
+                loss_G = loss_GAN_AB + loss_GAN_BA + loss_cycle_A + loss_cycle_B + loss_idt_A + loss_idt_B
+
+            scaler.scale(loss_G).backward()
+            scaler.step(optimizer_G)
+            scaler.update()
+
+            # Train Discriminator A
+            optimizer_D_A.zero_grad(set_to_none=True)
+            with torch.amp.autocast('cuda', enabled=config.use_amp):
+                pred_real_A = D_A(real_A)
+                pred_fake_A = D_A(fake_A.detach())
+                loss_D_A = 0.5 * (
+                    losses.adversarial_loss_lsgan(pred_real_A, True) +
+                    losses.adversarial_loss_lsgan(pred_fake_A, False)
+                )
+            scaler.scale(loss_D_A).backward()
+            scaler.step(optimizer_D_A)
+            scaler.update()
+
+            # Train Discriminator B
+            optimizer_D_B.zero_grad(set_to_none=True)
+            with torch.amp.autocast('cuda', enabled=config.use_amp):
+                pred_real_B = D_B(real_B)
+                pred_fake_B = D_B(fake_B.detach())
+                loss_D_B = 0.5 * (
+                    losses.adversarial_loss_lsgan(pred_real_B, True) +
+                    losses.adversarial_loss_lsgan(pred_fake_B, False)
+                )
+            scaler.scale(loss_D_B).backward()
+            scaler.step(optimizer_D_B)
+            scaler.update()
+
+            # Accumulate losses
+            for key, value in zip(epoch_losses.keys(),
+                                  [loss_G, loss_GAN_AB, loss_GAN_BA, loss_cycle_A, loss_cycle_B,
+                                   loss_idt_A, loss_idt_B, loss_D_A, loss_D_B]):
+                epoch_losses[key] += value.item()
+
+            progress_bar.set_postfix({
+                'G': f"{loss_G.item():.3f}",
+                'D_A': f"{loss_D_A.item():.3f}",
+                'D_B': f"{loss_D_B.item():.3f}"
+            })
+
+            if config.use_wandb and (i + 1) % 100 == 0:
+                wandb.log({
+                    "train/G_total": loss_G.item(),
+                    "train/G_GAN_AB": loss_GAN_AB.item(),
+                    "train/G_GAN_BA": loss_GAN_BA.item(),
+                    "train/G_cycle_A": loss_cycle_A.item(),
+                    "train/G_cycle_B": loss_cycle_B.item(),
+                    "train/G_idt_A": loss_idt_A.item(),
+                    "train/G_idt_B": loss_idt_B.item(),
+                    "train/D_A": loss_D_A.item(),
+                    "train/D_B": loss_D_B.item()
+                })
+
+        num_batches = len(dataloader)
+        if config.use_wandb:
+            wandb.log({f"epoch/{k}": v / num_batches for k, v in epoch_losses.items()})
+
+        # Generate samples
+        if (epoch + 1) % config.sample_every == 0:
+            G_AB.eval()
+            G_BA.eval()
+            with torch.no_grad():
+                sample_A = real_A[:4]
+                sample_B = real_B[:4]
+                fake_B_samples = G_AB(sample_A)
+                fake_A_samples = G_BA(sample_B)
+
+                sample_grid = make_grid(
+                    torch.cat([sample_A, fake_B_samples, sample_B, fake_A_samples], dim=0),
+                    nrow=4,
+                    normalize=True,
+                    value_range=(-1, 1)
+                )
+
+                save_path = os.path.join(config.output_dir, f'epoch_{epoch+1:03d}.png')
+                save_image(sample_grid, save_path)
+
+                if config.use_wandb:
+                    wandb.log({"samples": wandb.Image(sample_grid, caption=f"Epoch {epoch+1}")})
+
+            G_AB.train()
+            G_BA.train()
+
+        # Save checkpoint
+        if (epoch + 1) % config.checkpoint_every == 0:
+            checkpoint_path = os.path.join(config.checkpoint_dir, f'checkpoint_epoch_{epoch+1:03d}.pth')
+            torch.save({
+                'epoch': epoch,
+                'G_AB_state_dict': G_AB.state_dict(),
+                'G_BA_state_dict': G_BA.state_dict(),
+                'D_A_state_dict': D_A.state_dict(),
+                'D_B_state_dict': D_B.state_dict(),
+                'optimizer_G_state_dict': optimizer_G.state_dict(),
+                'optimizer_D_A_state_dict': optimizer_D_A.state_dict(),
+                'optimizer_D_B_state_dict': optimizer_D_B.state_dict(),
+                'scheduler_G_state_dict': scheduler_G.state_dict(),
+                'scheduler_D_A_state_dict': scheduler_D_A.state_dict(),
+                'scheduler_D_B_state_dict': scheduler_D_B.state_dict()
+            }, checkpoint_path)
+            print(f"\n Checkpoint saved: epoch_{epoch+1:03d}.pth")
+
+        scheduler_G.step()
+        scheduler_D_A.step()
+        scheduler_D_B.step()
+
+
+# START TRAINING
+if __name__ == "__main__":
+    print("\n" + "="*60)
+    print("Starting CycleGAN Training")
+    print("="*60)
+    print(f"Device: {config.device}")
+    print(f"Image size: {config.img_size}x{config.img_size}")
+    print(f"Batch size: {config.batch_size}")
+    print(f"Epochs: {config.epochs}")
+    print("="*60 + "\n")
+
+    if config.use_wandb:
+        try:
+            wandb.login()
+            wandb.init(
+                project=config.wandb_project,
+                entity=config.wandb_entity,
+                config=vars(config)
+            )
+            wandb.watch([G_AB, G_BA, D_A, D_B], log="all", log_freq=100)
+            print("WandB initialized successfully!\n")
+        except Exception as e:
+            print(f"WandB initialization failed: {e}")
+            print("Continuing without WandB logging...\n")
+            config.use_wandb = False
+
+    # Start training
+    train()
+
+    print("\n" + "="*60)
+    print("Training completed!")
+    print("="*60)
+
+    if config.use_wandb:
+        wandb.finish()
