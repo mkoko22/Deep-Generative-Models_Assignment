@@ -1,0 +1,509 @@
+"""
+CycleGAN Training Notebook with U-Net Generator - EXPERIMENT 2
+Kaggle Competition: I'm Something of a Painter Myself
+
+"""
+
+from google.colab import drive
+import os
+
+drive.mount('/content/drive', force_remount=False)
+
+BASE_DIR = '/content/drive/MyDrive/DGM-assignment'
+DATA_DIR = os.path.join(BASE_DIR, 'cyclegan_data')
+
+monet_path = os.path.join(DATA_DIR, 'monet_jpg')
+photo_path = os.path.join(DATA_DIR, 'photo_jpg')
+
+print("Monet path exists:", os.path.exists(monet_path))
+print("Photo path exists:", os.path.exists(photo_path))
+
+if os.path.exists(monet_path):
+    print("Monet images:", len(os.listdir(monet_path)))
+
+if os.path.exists(photo_path):
+    print("Photo images:", len(os.listdir(photo_path)))
+
+
+# IMPORTS
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from torchvision.utils import save_image, make_grid
+from PIL import Image
+import wandb
+from tqdm import tqdm
+import itertools
+from glob import glob
+
+print(f"\nPyTorch version: {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+
+
+# CONFIGURATION
+class Config:
+    base_dir = '/content/drive/MyDrive/DGM-assignment'
+    data_dir = os.path.join(base_dir, 'cyclegan_data')
+    monet_path = os.path.join(data_dir, 'monet_jpg')
+    photo_path = os.path.join(data_dir, 'photo_jpg')
+
+    checkpoint_dir = os.path.join(base_dir, 'cyclegan_unet_checkpoints')
+    output_dir = os.path.join(base_dir, 'cyclegan_unet_outputs')
+
+    # parameters
+    epochs = 100
+    batch_size = 2
+    lr = 0.0002
+    beta1 = 0.5
+    beta2 = 0.999
+
+    # Loss weights
+    lambda_cycle = 10.0
+    lambda_identity = 0.0
+
+    img_size = 128
+    input_channels = 3
+    output_channels = 3
+    ngf = 64
+    ndf = 64
+
+    checkpoint_every = 5 
+    sample_every = 2 
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    seed = 42
+    use_amp = False
+
+    # WandB
+    wandb_project = 'CycleGAN-Monet-UNet'
+    wandb_entity = 'mkoko22-free-university-of-tbilisi-'
+    use_wandb = True
+    wandb_log_freq = 250
+
+config = Config()
+os.makedirs(config.checkpoint_dir, exist_ok=True)
+os.makedirs(config.output_dir, exist_ok=True)
+
+print("Checking Config paths:")
+print(f"Monet path: {config.monet_path}")
+print(f"Monet exists: {os.path.exists(config.monet_path)}")
+if os.path.exists(config.monet_path):
+    print(f"Monet images: {len(os.listdir(config.monet_path))}")
+print(f"Photo path: {config.photo_path}")
+print(f"Photo exists: {os.path.exists(config.photo_path)}")
+if os.path.exists(config.photo_path):
+    print(f"Photo images: {len(os.listdir(config.photo_path))}")
+
+# SEED
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+set_seed(config.seed)
+
+# U-NET GENERATOR
+class UNetDownBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, normalize=True):
+        super().__init__()
+        layers = [nn.Conv2d(in_channels, out_channels, 4, stride=2, padding=1, bias=False)]
+        if normalize:
+            layers.append(nn.InstanceNorm2d(out_channels))
+        layers.append(nn.LeakyReLU(0.2, inplace=True))
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class UNetUpBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, dropout=0.0):
+        super().__init__()
+        layers = [
+            nn.ConvTranspose2d(in_channels, out_channels, 4, stride=2, padding=1, bias=False),
+            nn.InstanceNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        ]
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x, skip_input):
+        x = self.model(x)
+        x = torch.cat([x, skip_input], dim=1)
+        return x
+
+
+class UNetGenerator(nn.Module):
+    def __init__(self, input_channels=3, output_channels=3, ngf=64):
+        super().__init__()
+
+        self.down1 = UNetDownBlock(input_channels, ngf, normalize=False)
+        self.down2 = UNetDownBlock(ngf, ngf*2)
+        self.down3 = UNetDownBlock(ngf*2, ngf*4)
+        self.down4 = UNetDownBlock(ngf*4, ngf*8)
+        self.down5 = UNetDownBlock(ngf*8, ngf*8)
+
+        self.up1 = UNetUpBlock(ngf*8, ngf*8, dropout=0.5)
+        self.up2 = UNetUpBlock(ngf*16, ngf*4, dropout=0.5)
+        self.up3 = UNetUpBlock(ngf*8, ngf*2)
+        self.up4 = UNetUpBlock(ngf*4, ngf)
+
+        self.final = nn.Sequential(
+            nn.ConvTranspose2d(ngf*2, output_channels, 4, stride=2, padding=1),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        d1 = self.down1(x)
+        d2 = self.down2(d1)
+        d3 = self.down3(d2)
+        d4 = self.down4(d3)
+        d5 = self.down5(d4)
+
+        u1 = self.up1(d5, d4)
+        u2 = self.up2(u1, d3)
+        u3 = self.up3(u2, d2)
+        u4 = self.up4(u3, d1)
+
+        return self.final(u4)
+
+
+# DISCRIMINATOR
+class Discriminator(nn.Module):
+    """PatchGAN Discriminator"""
+    def __init__(self, input_channels=3, ndf=64):
+        super().__init__()
+        model = [
+            nn.Conv2d(input_channels, ndf, 4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True)
+        ]
+        nf_mult = 1
+        for i in range(3):
+            nf_mult_prev = nf_mult
+            nf_mult = min(2**(i+1), 8)
+            stride = 2 if i<2 else 1
+            model += [
+                nn.Conv2d(ndf*nf_mult_prev, ndf*nf_mult, 4, stride=stride, padding=1, bias=False),
+                nn.InstanceNorm2d(ndf*nf_mult),
+                nn.LeakyReLU(0.2, inplace=True)
+            ]
+        model += [nn.Conv2d(ndf*nf_mult, 1, 4, stride=1, padding=1)]
+        self.model = nn.Sequential(*model)
+
+    def forward(self, x):
+        return self.model(x)
+
+
+# LOSS FUNCTIONS
+class CycleGANLosses:
+    @staticmethod
+    def adversarial_loss_lsgan(pred, target_is_real):
+        """LSGAN loss"""
+        target = torch.ones_like(pred) if target_is_real else torch.zeros_like(pred)
+        return torch.mean((pred - target)**2)
+
+    @staticmethod
+    def cycle_consistency_loss(real, recon):
+        """L1 cycle consistency loss"""
+        return torch.mean(torch.abs(real - recon))
+
+
+# DATASET
+class ImageDataset(Dataset):
+    def __init__(self, root_monet, root_photo, transform=None):
+        self.transform = transform
+        self.files_monet = sorted(glob(os.path.join(root_monet, '*.jpg')))
+        self.files_photo = sorted(glob(os.path.join(root_photo, '*.jpg')))
+        print(f"Found {len(self.files_monet)} Monet images and {len(self.files_photo)} photo images")
+
+    def __getitem__(self, idx):
+        img_monet = Image.open(self.files_monet[idx % len(self.files_monet)]).convert('RGB')
+        img_photo = Image.open(self.files_photo[random.randint(0, len(self.files_photo)-1)]).convert('RGB')
+        if self.transform:
+            img_monet = self.transform(img_monet)
+            img_photo = self.transform(img_photo)
+        return {'monet': img_monet, 'photo': img_photo}
+
+    def __len__(self):
+        return max(len(self.files_monet), len(self.files_photo))
+
+
+# TRANSFORMS
+transform = transforms.Compose([
+    transforms.Resize((config.img_size, config.img_size), Image.BICUBIC),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
+])
+dataset = ImageDataset(config.monet_path, config.photo_path, transform)
+dataloader = DataLoader(
+    dataset,
+    batch_size=config.batch_size,
+    shuffle=True,
+    num_workers=2,
+    pin_memory=True,
+    persistent_workers=True
+)
+
+
+# INITIALIZE MODELS
+print("\n" + "="*60)
+print("EXPERIMENT 2: U-Net Generator Architecture (OPTIMIZED)")
+print("="*60)
+print("Initializing models with U-Net generators...")
+
+G_AB = UNetGenerator(config.input_channels, config.output_channels, config.ngf).to(config.device)
+G_BA = UNetGenerator(config.output_channels, config.input_channels, config.ngf).to(config.device)
+D_A = Discriminator(config.input_channels, config.ndf).to(config.device)
+D_B = Discriminator(config.output_channels, config.ndf).to(config.device)
+
+print(f"\nGenerator type: U-Net with skip connections")
+print(f"Discriminator type: PatchGAN")
+total_params_g = sum(p.numel() for p in G_AB.parameters())
+total_params_d = sum(p.numel() for p in D_A.parameters())
+print(f"Generator parameters: {total_params_g:,}")
+print(f"Discriminator parameters: {total_params_d:,}")
+
+
+# WEIGHT INIT
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
+        if hasattr(m, 'bias') and m.bias is not None:
+            nn.init.constant_(m.bias.data, 0.0)
+    elif classname.find('BatchNorm') != -1 or classname.find('InstanceNorm') != -1:
+        if hasattr(m, 'weight') and m.weight is not None:
+            nn.init.normal_(m.weight.data, 1.0, 0.02)
+        if hasattr(m, 'bias') and m.bias is not None:
+            nn.init.constant_(m.bias.data, 0.0)
+
+G_AB.apply(weights_init)
+G_BA.apply(weights_init)
+D_A.apply(weights_init)
+D_B.apply(weights_init)
+
+
+# OPTIMIZERS
+optimizer_G = optim.Adam(itertools.chain(G_AB.parameters(), G_BA.parameters()),
+                         lr=config.lr, betas=(config.beta1, config.beta2))
+optimizer_D_A = optim.Adam(D_A.parameters(), lr=config.lr, betas=(config.beta1, config.beta2))
+optimizer_D_B = optim.Adam(D_B.parameters(), lr=config.lr, betas=(config.beta1, config.beta2))
+
+
+# LR SCHEDULERS
+def lambda_rule(epoch):
+    lr_l = 1.0 - max(0, epoch - config.epochs//2) / float(config.epochs//2 + 1)
+    return lr_l
+
+scheduler_G = optim.lr_scheduler.LambdaLR(optimizer_G, lr_lambda=lambda_rule)
+scheduler_D_A = optim.lr_scheduler.LambdaLR(optimizer_D_A, lr_lambda=lambda_rule)
+scheduler_D_B = optim.lr_scheduler.LambdaLR(optimizer_D_B, lr_lambda=lambda_rule)
+
+losses = CycleGANLosses()
+
+
+# LOAD CHECKPOINT IF EXISTS
+checkpoint_files = sorted(glob(os.path.join(config.checkpoint_dir, 'checkpoint_epoch_*.pth')))
+start_epoch = 0
+if checkpoint_files:
+    latest_ckpt = checkpoint_files[-1]
+    print(f"\nFound checkpoint: {latest_ckpt}")
+    ckpt = torch.load(latest_ckpt, map_location=config.device)
+    G_AB.load_state_dict(ckpt['G_AB_state_dict'])
+    G_BA.load_state_dict(ckpt['G_BA_state_dict'])
+    D_A.load_state_dict(ckpt['D_A_state_dict'])
+    D_B.load_state_dict(ckpt['D_B_state_dict'])
+    optimizer_G.load_state_dict(ckpt['optimizer_G_state_dict'])
+    optimizer_D_A.load_state_dict(ckpt['optimizer_D_A_state_dict'])
+    optimizer_D_B.load_state_dict(ckpt['optimizer_D_B_state_dict'])
+    start_epoch = ckpt['epoch'] + 1
+    print(f"Resuming from epoch {start_epoch}")
+
+
+# TRAIN FUNCTION
+def train():
+    global start_epoch
+    for epoch in range(start_epoch, config.epochs):
+        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{config.epochs}", ncols=120)
+
+        epoch_losses = {
+            "G_total": 0.0, "G_GAN_AB": 0.0, "G_GAN_BA": 0.0,
+            "G_cycle_A": 0.0, "G_cycle_B": 0.0,
+            "D_A": 0.0, "D_B": 0.0
+        }
+
+        for i, batch in enumerate(progress_bar):
+            real_A = batch['photo'].to(config.device, non_blocking=True)
+            real_B = batch['monet'].to(config.device, non_blocking=True)
+
+            optimizer_G.zero_grad(set_to_none=True)
+
+            # Forward pass
+            fake_B = G_AB(real_A)
+            fake_A = G_BA(real_B)
+
+            # GAN loss
+            loss_GAN_AB = losses.adversarial_loss_lsgan(D_B(fake_B), True)
+            loss_GAN_BA = losses.adversarial_loss_lsgan(D_A(fake_A), True)
+
+            # Cycle consistency loss
+            recov_A = G_BA(fake_B)
+            recov_B = G_AB(fake_A)
+            loss_cycle_A = losses.cycle_consistency_loss(real_A, recov_A) * config.lambda_cycle
+            loss_cycle_B = losses.cycle_consistency_loss(real_B, recov_B) * config.lambda_cycle
+
+            loss_G = loss_GAN_AB + loss_GAN_BA + loss_cycle_A + loss_cycle_B
+
+            loss_G.backward()
+            optimizer_G.step()
+
+            # Train Discriminator A 
+            optimizer_D_A.zero_grad(set_to_none=True)
+            pred_real_A = D_A(real_A)
+            pred_fake_A = D_A(fake_A.detach())
+            loss_D_A = 0.5 * (
+                losses.adversarial_loss_lsgan(pred_real_A, True) +
+                losses.adversarial_loss_lsgan(pred_fake_A, False)
+            )
+            loss_D_A.backward()
+            optimizer_D_A.step()
+
+            # Train Discriminator B
+            optimizer_D_B.zero_grad(set_to_none=True)
+            pred_real_B = D_B(real_B)
+            pred_fake_B = D_B(fake_B.detach())
+            loss_D_B = 0.5 * (
+                losses.adversarial_loss_lsgan(pred_real_B, True) +
+                losses.adversarial_loss_lsgan(pred_fake_B, False)
+            )
+            loss_D_B.backward()
+            optimizer_D_B.step()
+
+            # Accumulate losses
+            epoch_losses["G_total"] += loss_G.item()
+            epoch_losses["G_GAN_AB"] += loss_GAN_AB.item()
+            epoch_losses["G_GAN_BA"] += loss_GAN_BA.item()
+            epoch_losses["G_cycle_A"] += loss_cycle_A.item()
+            epoch_losses["G_cycle_B"] += loss_cycle_B.item()
+            epoch_losses["D_A"] += loss_D_A.item()
+            epoch_losses["D_B"] += loss_D_B.item()
+
+            progress_bar.set_postfix({
+                'G': f"{loss_G.item():.3f}",
+                'D_A': f"{loss_D_A.item():.3f}",
+                'D_B': f"{loss_D_B.item():.3f}"
+            })
+
+            if config.use_wandb and (i + 1) % config.wandb_log_freq == 0:
+                wandb.log({
+                    "train/G_total": loss_G.item(),
+                    "train/G_GAN_AB": loss_GAN_AB.item(),
+                    "train/G_GAN_BA": loss_GAN_BA.item(),
+                    "train/G_cycle_A": loss_cycle_A.item(),
+                    "train/G_cycle_B": loss_cycle_B.item(),
+                    "train/D_A": loss_D_A.item(),
+                    "train/D_B": loss_D_B.item()
+                })
+
+        num_batches = len(dataloader)
+        if config.use_wandb:
+            wandb.log({
+                f"epoch/{k}": v/num_batches for k, v in epoch_losses.items()
+            })
+
+        # Generate samples
+        if (epoch + 1) % config.sample_every == 0:
+            G_AB.eval()
+            G_BA.eval()
+            with torch.no_grad():
+                sample_A = real_A[:1]
+                sample_B = real_B[:1]
+                fake_B_samples = G_AB(sample_A)
+                fake_A_samples = G_BA(sample_B)
+
+                sample_grid = make_grid(
+                    torch.cat([sample_A, fake_B_samples, sample_B, fake_A_samples], dim=0),
+                    nrow=4,
+                    normalize=True,
+                    value_range=(-1, 1)
+                )
+
+                save_path = os.path.join(config.output_dir, f'epoch_{epoch+1:03d}.png')
+                save_image(sample_grid, save_path)
+
+                if config.use_wandb:
+                    wandb.log({
+                        "samples": wandb.Image(sample_grid, caption=f"Epoch {epoch+1}")
+                    })
+
+            G_AB.train()
+            G_BA.train()
+
+        # Save checkpoint
+        checkpoint_path = os.path.join(config.checkpoint_dir, f'checkpoint_epoch_{epoch+1:03d}.pth')
+        torch.save({
+            'epoch': epoch,
+            'G_AB_state_dict': G_AB.state_dict(),
+            'G_BA_state_dict': G_BA.state_dict(),
+            'D_A_state_dict': D_A.state_dict(),
+            'D_B_state_dict': D_B.state_dict(),
+            'optimizer_G_state_dict': optimizer_G.state_dict(),
+            'optimizer_D_A_state_dict': optimizer_D_A.state_dict(),
+            'optimizer_D_B_state_dict': optimizer_D_B.state_dict(),
+            'scheduler_G_state_dict': scheduler_G.state_dict(),
+            'scheduler_D_A_state_dict': scheduler_D_A.state_dict(),
+            'scheduler_D_B_state_dict': scheduler_D_B.state_dict()
+        }, checkpoint_path)
+
+        print(f"\n✓ Checkpoint saved: epoch_{epoch+1:03d}.pth")
+
+        scheduler_G.step()
+        scheduler_D_A.step()
+        scheduler_D_B.step()
+
+
+# START TRAINING
+if __name__ == "__main__":
+    print("\n" + "="*60)
+    print("EXPERIMENT 2: CycleGAN with U-Net Generator (OPTIMIZED)")
+    print("="*60)
+    print(f"Device: {config.device}")
+    print(f"Image size: {config.img_size}x{config.img_size}")
+    print(f"Batch size: {config.batch_size} (kept at 1)")
+    print(f"Epochs: {config.epochs}")
+    print(f"Generator: U-Net")
+    print(f"Loss: LSGAN")
+    print("="*60 + "\n")
+
+    if config.use_wandb:
+        try:
+            wandb.login()
+            wandb.init(
+                project=config.wandb_project,
+                entity=config.wandb_entity,
+                config=vars(config),
+                name="UNet-Generator-Optimized-Batch1"
+            )
+            wandb.watch([G_AB, G_BA, D_A, D_B], log="all", log_freq=config.wandb_log_freq)
+            print("WandB initialized successfully!\n")
+        except Exception as e:
+            print(f"WandB initialization failed: {e}")
+            print("Continuing without WandB logging...\n")
+            config.use_wandb = False
+
+    train()
+
+    print("\n" + "="*60)
+    print("Training completed!")
+    print("="*60)
+
+    if config.use_wandb:
+        wandb.finish()
